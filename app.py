@@ -5,14 +5,14 @@ import re
 import shutil
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 from starlette.background import BackgroundTask
 import yt_dlp
@@ -22,8 +22,9 @@ MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "10800"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "20"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
+YOUTUBE_JOB_TIMEOUT = int(os.getenv("YOUTUBE_JOB_TIMEOUT", "900"))
+MAX_WORKER_UPLOAD_BYTES = int(os.getenv("MAX_WORKER_UPLOAD_BYTES", str(1024 * 1024 * 1024)))
 INSTAGRAM_COOKIES_B64 = os.getenv("INSTAGRAM_COOKIES_B64", "").strip()
-YOUTUBE_WORKER_URL = os.getenv("YOUTUBE_WORKER_URL", "").strip().rstrip("/")
 YOUTUBE_WORKER_TOKEN = os.getenv("YOUTUBE_WORKER_TOKEN", "").strip()
 
 ALLOWED_HOSTS = {
@@ -41,7 +42,7 @@ ALLOWED_HOSTS = {
 cors_env = os.getenv("CORS_ORIGINS", "*")
 CORS_ORIGINS = [x.strip() for x in cors_env.split(",") if x.strip()]
 
-app = FastAPI(title=APP_NAME, version="1.4.0")
+app = FastAPI(title=APP_NAME, version="1.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -52,15 +53,14 @@ app.add_middleware(
 
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 _rate_state: dict[str, list[float]] = {}
+_jobs: dict[str, dict] = {}
+_jobs_lock = asyncio.Lock()
+_last_worker_seen = 0.0
 
 
 class MediaRequest(BaseModel):
     url: HttpUrl
     format: Literal["mp4", "mp3"] = "mp4"
-
-
-class InfoRequest(BaseModel):
-    url: HttpUrl
 
 
 def _client_ip(request: Request) -> str:
@@ -158,6 +158,8 @@ def _remove_temp_file(path: str | None) -> None:
 def _friendly_download_error(exc: Exception) -> str:
     text = str(exc)
     low = text.lower()
+    if "there is no video in this post" in low:
+        return "Essa publicação do Instagram não contém um vídeo disponível para download. Tente um Reel ou uma publicação com vídeo."
     if "instagram" in low and (
         "rate-limit" in low or "rate limit" in low or "login required" in low
         or "requested content is not available" in low or "authentication" in low
@@ -166,74 +168,77 @@ def _friendly_download_error(exc: Exception) -> str:
     return f"Não foi possível processar essa mídia: {text}"
 
 
-async def _worker_request(path: str, payload: dict):
-    if not YOUTUBE_WORKER_URL or not YOUTUBE_WORKER_TOKEN:
-        raise HTTPException(
-            status_code=503,
-            detail="O processador do YouTube está offline ou ainda não foi configurado."
-        )
+def _worker_authorized(request: Request) -> bool:
+    supplied = request.headers.get("x-worker-token", "")
+    return bool(YOUTUBE_WORKER_TOKEN) and supplied == YOUTUBE_WORKER_TOKEN
 
-    client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=20.0, read=None, write=60.0, pool=20.0),
-        follow_redirects=True,
-    )
-    req = client.build_request(
-        "POST",
-        f"{YOUTUBE_WORKER_URL}{path}",
-        json=payload,
-        headers={"X-Worker-Token": YOUTUBE_WORKER_TOKEN},
-    )
+
+def _cleanup_dir(path: str) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+
+
+async def _cleanup_job(job_id: str) -> None:
+    async with _jobs_lock:
+        job = _jobs.pop(job_id, None)
+    if job:
+        _cleanup_dir(job["tmpdir"])
+
+
+async def _queue_youtube_download(raw_url: str, media_format: str):
+    if not YOUTUBE_WORKER_TOKEN:
+        raise HTTPException(status_code=503, detail="O processador do YouTube ainda não foi configurado.")
+
+    job_id = uuid.uuid4().hex
+    tmpdir = tempfile.mkdtemp(prefix="baixou-job-")
+    event = asyncio.Event()
+    job = {
+        "id": job_id,
+        "url": raw_url,
+        "format": media_format,
+        "status": "pending",
+        "created_at": time.time(),
+        "tmpdir": tmpdir,
+        "event": event,
+        "file_path": None,
+        "filename": None,
+        "media_type": None,
+        "error": None,
+        "error_status": 502,
+    }
+    async with _jobs_lock:
+        _jobs[job_id] = job
 
     try:
-        response = await client.send(req, stream=True)
-    except Exception:
-        await client.aclose()
+        await asyncio.wait_for(event.wait(), timeout=YOUTUBE_JOB_TIMEOUT)
+    except asyncio.TimeoutError:
+        await _cleanup_job(job_id)
         raise HTTPException(
-            status_code=502,
-            detail="Não foi possível conectar ao processador do YouTube no celular."
+            status_code=504,
+            detail="O processador do YouTube demorou além do limite. Verifique se o worker do celular está ativo."
         )
 
-    return client, response
+    async with _jobs_lock:
+        current = _jobs.get(job_id)
 
+    if not current:
+        raise HTTPException(status_code=502, detail="O processamento do YouTube foi interrompido.")
 
-async def _proxy_youtube_download(raw_url: str, media_format: str):
-    client, response = await _worker_request(
-        "/download", {"url": raw_url, "format": media_format}
-    )
+    if current.get("error"):
+        status = int(current.get("error_status") or 502)
+        detail = str(current["error"])
+        await _cleanup_job(job_id)
+        raise HTTPException(status_code=status, detail=detail)
 
-    if response.status_code >= 400:
-        body = await response.aread()
-        await response.aclose()
-        await client.aclose()
-        detail = "O processador do YouTube não conseguiu concluir o download."
-        try:
-            import json
-            parsed = json.loads(body.decode("utf-8", errors="replace"))
-            detail = parsed.get("detail") or detail
-        except Exception:
-            pass
-        raise HTTPException(status_code=response.status_code, detail=detail)
+    file_path = current.get("file_path")
+    if not file_path or not Path(file_path).is_file():
+        await _cleanup_job(job_id)
+        raise HTTPException(status_code=502, detail="O worker não devolveu um arquivo válido.")
 
-    async def iterator():
-        try:
-            async for chunk in response.aiter_bytes():
-                yield chunk
-        finally:
-            await response.aclose()
-            await client.aclose()
-
-    headers = {}
-    cd = response.headers.get("content-disposition")
-    if cd:
-        headers["Content-Disposition"] = cd
-
-    return StreamingResponse(
-        iterator(),
-        media_type=response.headers.get(
-            "content-type",
-            "audio/mpeg" if media_format == "mp3" else "video/mp4"
-        ),
-        headers=headers,
+    return FileResponse(
+        file_path,
+        media_type=current.get("media_type") or ("audio/mpeg" if media_format == "mp3" else "video/mp4"),
+        filename=current.get("filename") or f"baixou.{media_format}",
+        background=BackgroundTask(_cleanup_job, job_id),
     )
 
 
@@ -276,23 +281,123 @@ def _download_instagram_sync(raw_url: str, media_format: str, tmpdir: str) -> tu
     return str(final_path), f"{title}{wanted_ext}"
 
 
-def _cleanup_dir(path: str) -> None:
-    shutil.rmtree(path, ignore_errors=True)
-
-
 @app.get("/")
 def root():
+    worker_online = bool(_last_worker_seen and (time.time() - _last_worker_seen) < 30)
     return {
         "name": APP_NAME,
         "status": "online",
-        "version": "1.4.0",
-        "youtube_worker_configured": bool(YOUTUBE_WORKER_URL and YOUTUBE_WORKER_TOKEN),
+        "version": "1.5.0",
+        "youtube_worker_configured": bool(YOUTUBE_WORKER_TOKEN),
+        "youtube_worker_online": worker_online,
         "instagram_server_auth_configured": bool(INSTAGRAM_COOKIES_B64),
     }
 
 
 @app.get("/health")
 def health():
+    return {"ok": True}
+
+
+@app.get("/worker/next")
+async def worker_next(request: Request):
+    global _last_worker_seen
+    if not _worker_authorized(request):
+        raise HTTPException(status_code=401, detail="Não autorizado.")
+    _last_worker_seen = time.time()
+
+    async with _jobs_lock:
+        pending = [j for j in _jobs.values() if j.get("status") == "pending"]
+        if not pending:
+            return Response(status_code=204)
+        job = min(pending, key=lambda j: j["created_at"])
+        job["status"] = "processing"
+        job["picked_at"] = time.time()
+        return {"id": job["id"], "url": job["url"], "format": job["format"]}
+
+
+@app.post("/worker/result/{job_id}")
+async def worker_result(job_id: str, request: Request):
+    global _last_worker_seen
+    if not _worker_authorized(request):
+        raise HTTPException(status_code=401, detail="Não autorizado.")
+    _last_worker_seen = time.time()
+
+    async with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Trabalho não encontrado ou expirado.")
+
+    ext = ".mp3" if job["format"] == "mp3" else ".mp4"
+    target = Path(job["tmpdir"]) / f"result{ext}"
+    total = 0
+    try:
+        with target.open("wb") as handle:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_WORKER_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Arquivo acima do limite permitido.")
+                handle.write(chunk)
+    except Exception:
+        try:
+            target.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+    if total == 0:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Arquivo vazio.")
+
+    filename = f"baixou{ext}"
+    encoded_name = request.headers.get("x-filename-b64", "")
+    if encoded_name:
+        try:
+            filename = base64.b64decode(encoded_name).decode("utf-8")
+        except Exception:
+            pass
+    filename = _safe_filename(filename)
+    if not filename.lower().endswith(ext):
+        filename += ext
+
+    async with _jobs_lock:
+        current = _jobs.get(job_id)
+        if not current:
+            target.unlink(missing_ok=True)
+            raise HTTPException(status_code=404, detail="Trabalho expirado.")
+        current["file_path"] = str(target)
+        current["filename"] = filename
+        current["media_type"] = request.headers.get("x-media-type") or ("audio/mpeg" if ext == ".mp3" else "video/mp4")
+        current["status"] = "done"
+        current["event"].set()
+
+    return {"ok": True, "bytes": total}
+
+
+@app.post("/worker/error/{job_id}")
+async def worker_error(job_id: str, request: Request):
+    global _last_worker_seen
+    if not _worker_authorized(request):
+        raise HTTPException(status_code=401, detail="Não autorizado.")
+    _last_worker_seen = time.time()
+
+    data = await request.json()
+    detail = str(data.get("detail") or "O worker não conseguiu concluir o download.")[:2000]
+    status_code = int(data.get("status") or 422)
+    if status_code < 400 or status_code > 599:
+        status_code = 422
+
+    async with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Trabalho não encontrado ou expirado.")
+        job["error"] = detail
+        job["error_status"] = status_code
+        job["status"] = "error"
+        job["event"].set()
+
     return {"ok": True}
 
 
@@ -303,7 +408,7 @@ async def download(payload: MediaRequest, request: Request):
     _validate_url(raw_url)
 
     if _is_youtube(raw_url):
-        return await _proxy_youtube_download(raw_url, payload.format)
+        return await _queue_youtube_download(raw_url, payload.format)
 
     tmpdir = tempfile.mkdtemp(prefix="baixou-")
     try:
