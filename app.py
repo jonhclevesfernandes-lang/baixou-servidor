@@ -39,7 +39,7 @@ ALLOWED_HOSTS = {
 cors_env = os.getenv("CORS_ORIGINS", "*")
 CORS_ORIGINS = [x.strip() for x in cors_env.split(",") if x.strip()]
 
-app = FastAPI(title=APP_NAME, version="1.2.1")
+app = FastAPI(title=APP_NAME, version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -129,40 +129,37 @@ def _base_ydl_options(tmpdir: str) -> dict:
 
 
 def _apply_youtube_options(opts: dict, raw_url: str) -> None:
-    """Avoid the problematic logged-in tv_downgraded client."""
-    if _is_youtube(raw_url):
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["default", "web_embedded"],
-            }
-        }
+    if not _is_youtube(raw_url):
+        return
+
+    # Current yt-dlp guidance recommends mweb + an automatic PO-token provider.
+    # The provider runs locally in this same container on 127.0.0.1:4416.
+    opts["extractor_args"] = {
+        "youtube": {
+            "player_client": ["mweb"],
+        },
+        "youtubepot-bgutilhttp": {
+            "base_url": ["http://127.0.0.1:4416"],
+        },
+    }
 
 
-def _platform_cookie_secret(raw_url: str) -> tuple[str, str] | None:
-    if _is_instagram(raw_url) and INSTAGRAM_COOKIES_B64:
-        return INSTAGRAM_COOKIES_B64, "instagram"
-    if _is_youtube(raw_url) and YOUTUBE_COOKIES_B64:
-        return YOUTUBE_COOKIES_B64, "youtube"
-    return None
-
-
-def _attach_platform_cookiefile(opts: dict, raw_url: str) -> str | None:
-    """Attach a temporary Netscape cookie file only on the server."""
-    secret = _platform_cookie_secret(raw_url)
-    if not secret:
+def _attach_instagram_cookiefile(opts: dict, raw_url: str) -> str | None:
+    # Deliberately use account cookies only for Instagram.
+    # Public YouTube downloads use mweb + local PO tokens instead, which is
+    # safer for the account and avoids rotating/invalid session cookies.
+    if not _is_instagram(raw_url) or not INSTAGRAM_COOKIES_B64:
         return None
 
-    encoded, platform = secret
     try:
-        cookie_text = base64.b64decode(encoded).decode("utf-8")
+        cookie_text = base64.b64decode(INSTAGRAM_COOKIES_B64).decode("utf-8")
     except Exception as exc:
-        label = "Instagram" if platform == "instagram" else "YouTube"
-        raise RuntimeError(f"Configuração de autenticação do {label} inválida.") from exc
+        raise RuntimeError("Configuração de autenticação do Instagram inválida.") from exc
 
     tmp = tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".txt",
-        prefix=f"baixou-{platform}-",
+        prefix="baixou-instagram-",
         delete=False,
         encoding="utf-8",
     )
@@ -197,19 +194,14 @@ def _friendly_download_error(exc: Exception) -> str:
     ):
         return "O Instagram solicitou autenticação para este conteúdo. Tente novamente ou use outro link público."
 
-    youtube_auth = (
-        "youtube" in low
-        and (
-            "sign in to confirm you" in low
-            or "not a bot" in low
-            or "login required" in low
-            or "authentication" in low
-            or "use --cookies" in low
-            or "page needs to be reloaded" in low
-        )
-    )
-    if youtube_auth:
-        return "O YouTube recusou a sessão usada pelo servidor. Atualize os cookies do YouTube e tente novamente."
+    if "youtube" in low and (
+        "sign in to confirm you" in low
+        or "not a bot" in low
+        or "page needs to be reloaded" in low
+        or "po token" in low
+        or "http error 403" in low
+    ):
+        return "O YouTube recusou esta solicitação. O servidor tentou a validação automática; tente novamente em instantes."
 
     return f"Não foi possível processar essa mídia: {text}"
 
@@ -219,7 +211,7 @@ def _extract_info_sync(raw_url: str) -> dict:
     opts["skip_download"] = True
     _apply_youtube_options(opts, raw_url)
 
-    cookie_file = _attach_platform_cookiefile(opts, raw_url)
+    cookie_file = _attach_instagram_cookiefile(opts, raw_url)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(raw_url, download=False)
@@ -252,7 +244,7 @@ def _download_sync(raw_url: str, media_format: str, tmpdir: str) -> tuple[str, s
         )
 
     _apply_youtube_options(opts, raw_url)
-    cookie_file = _attach_platform_cookiefile(opts, raw_url)
+    cookie_file = _attach_instagram_cookiefile(opts, raw_url)
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -285,10 +277,10 @@ def root():
     return {
         "name": APP_NAME,
         "status": "online",
-        "version": "1.2.1",
+        "version": "1.3.0",
         "message": "API do Baixou pronta para processar links públicos suportados.",
         "instagram_server_auth_configured": bool(INSTAGRAM_COOKIES_B64),
-        "youtube_server_auth_configured": bool(YOUTUBE_COOKIES_B64),
+        "youtube_po_provider": "bgutil-local",
     }
 
 
