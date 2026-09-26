@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
 from starlette.background import BackgroundTask
 import yt_dlp
@@ -22,7 +23,8 @@ MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "20"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 INSTAGRAM_COOKIES_B64 = os.getenv("INSTAGRAM_COOKIES_B64", "").strip()
-YOUTUBE_COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+YOUTUBE_WORKER_URL = os.getenv("YOUTUBE_WORKER_URL", "").strip().rstrip("/")
+YOUTUBE_WORKER_TOKEN = os.getenv("YOUTUBE_WORKER_TOKEN", "").strip()
 
 ALLOWED_HOSTS = {
     "youtube.com",
@@ -39,7 +41,7 @@ ALLOWED_HOSTS = {
 cors_env = os.getenv("CORS_ORIGINS", "*")
 CORS_ORIGINS = [x.strip() for x in cors_env.split(",") if x.strip()]
 
-app = FastAPI(title=APP_NAME, version="1.3.0")
+app = FastAPI(title=APP_NAME, version="1.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -79,15 +81,6 @@ def _check_rate_limit(request: Request) -> None:
     _rate_state[ip] = hits
 
 
-def _validate_url(raw_url: str) -> None:
-    parsed = urlparse(raw_url)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme not in {"http", "https"}:
-        raise HTTPException(status_code=400, detail="URL inválida.")
-    if host not in ALLOWED_HOSTS:
-        raise HTTPException(status_code=400, detail="Plataforma não suportada.")
-
-
 def _host(raw_url: str) -> str:
     return (urlparse(raw_url).hostname or "").lower()
 
@@ -108,6 +101,13 @@ def _is_youtube(raw_url: str) -> bool:
     }
 
 
+def _validate_url(raw_url: str) -> None:
+    parsed = urlparse(raw_url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or host not in ALLOWED_HOSTS:
+        raise HTTPException(status_code=400, detail="Plataforma não suportada.")
+
+
 def _safe_filename(value: str) -> str:
     value = re.sub(r"[^\w\-. ()]+", "_", value, flags=re.UNICODE).strip(" ._")
     return value[:140] or "baixou"
@@ -118,57 +118,31 @@ def _base_ydl_options(tmpdir: str) -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "restrictfilenames": False,
         "cachedir": False,
         "socket_timeout": 30,
         "retries": 5,
         "fragment_retries": 5,
-        "extractor_retries": 3,
         "outtmpl": str(Path(tmpdir) / "%(title).120s [%(id)s].%(ext)s"),
     }
 
 
-def _apply_youtube_options(opts: dict, raw_url: str) -> None:
-    if not _is_youtube(raw_url):
-        return
-
-    # Current yt-dlp guidance recommends mweb + an automatic PO-token provider.
-    # The provider runs locally in this same container on 127.0.0.1:4416.
-    opts["extractor_args"] = {
-        "youtube": {
-            "player_client": ["mweb"],
-        },
-        "youtubepot-bgutilhttp": {
-            "base_url": ["http://127.0.0.1:4416"],
-        },
-    }
-
-
 def _attach_instagram_cookiefile(opts: dict, raw_url: str) -> str | None:
-    # Deliberately use account cookies only for Instagram.
-    # Public YouTube downloads use mweb + local PO tokens instead, which is
-    # safer for the account and avoids rotating/invalid session cookies.
     if not _is_instagram(raw_url) or not INSTAGRAM_COOKIES_B64:
         return None
-
     try:
         cookie_text = base64.b64decode(INSTAGRAM_COOKIES_B64).decode("utf-8")
     except Exception as exc:
         raise RuntimeError("Configuração de autenticação do Instagram inválida.") from exc
 
     tmp = tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".txt",
-        prefix="baixou-instagram-",
-        delete=False,
-        encoding="utf-8",
+        mode="w", suffix=".txt", prefix="baixou-instagram-",
+        delete=False, encoding="utf-8"
     )
     try:
         tmp.write(cookie_text)
         tmp.flush()
     finally:
         tmp.close()
-
     opts["cookiefile"] = tmp.name
     return tmp.name
 
@@ -184,88 +158,122 @@ def _remove_temp_file(path: str | None) -> None:
 def _friendly_download_error(exc: Exception) -> str:
     text = str(exc)
     low = text.lower()
-
     if "instagram" in low and (
-        "rate-limit" in low
-        or "rate limit" in low
-        or "login required" in low
-        or "requested content is not available" in low
-        or "authentication" in low
+        "rate-limit" in low or "rate limit" in low or "login required" in low
+        or "requested content is not available" in low or "authentication" in low
     ):
         return "O Instagram solicitou autenticação para este conteúdo. Tente novamente ou use outro link público."
-
-    if "youtube" in low and (
-        "sign in to confirm you" in low
-        or "not a bot" in low
-        or "page needs to be reloaded" in low
-        or "po token" in low
-        or "http error 403" in low
-    ):
-        return "O YouTube recusou esta solicitação. O servidor tentou a validação automática; tente novamente em instantes."
-
     return f"Não foi possível processar essa mídia: {text}"
 
 
-def _extract_info_sync(raw_url: str) -> dict:
-    opts = _base_ydl_options(tempfile.gettempdir())
-    opts["skip_download"] = True
-    _apply_youtube_options(opts, raw_url)
+async def _worker_request(path: str, payload: dict):
+    if not YOUTUBE_WORKER_URL or not YOUTUBE_WORKER_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="O processador do YouTube está offline ou ainda não foi configurado."
+        )
 
-    cookie_file = _attach_instagram_cookiefile(opts, raw_url)
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=20.0, read=None, write=60.0, pool=20.0),
+        follow_redirects=True,
+    )
+    req = client.build_request(
+        "POST",
+        f"{YOUTUBE_WORKER_URL}{path}",
+        json=payload,
+        headers={"X-Worker-Token": YOUTUBE_WORKER_TOKEN},
+    )
+
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(raw_url, download=False)
-    finally:
-        _remove_temp_file(cookie_file)
+        response = await client.send(req, stream=True)
+    except Exception:
+        await client.aclose()
+        raise HTTPException(
+            status_code=502,
+            detail="Não foi possível conectar ao processador do YouTube no celular."
+        )
+
+    return client, response
 
 
-def _download_sync(raw_url: str, media_format: str, tmpdir: str) -> tuple[str, str]:
+async def _proxy_youtube_download(raw_url: str, media_format: str):
+    client, response = await _worker_request(
+        "/download", {"url": raw_url, "format": media_format}
+    )
+
+    if response.status_code >= 400:
+        body = await response.aread()
+        await response.aclose()
+        await client.aclose()
+        detail = "O processador do YouTube não conseguiu concluir o download."
+        try:
+            import json
+            parsed = json.loads(body.decode("utf-8", errors="replace"))
+            detail = parsed.get("detail") or detail
+        except Exception:
+            pass
+        raise HTTPException(status_code=response.status_code, detail=detail)
+
+    async def iterator():
+        try:
+            async for chunk in response.aiter_bytes():
+                yield chunk
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    headers = {}
+    cd = response.headers.get("content-disposition")
+    if cd:
+        headers["Content-Disposition"] = cd
+
+    return StreamingResponse(
+        iterator(),
+        media_type=response.headers.get(
+            "content-type",
+            "audio/mpeg" if media_format == "mp3" else "video/mp4"
+        ),
+        headers=headers,
+    )
+
+
+def _download_instagram_sync(raw_url: str, media_format: str, tmpdir: str) -> tuple[str, str]:
     opts = _base_ydl_options(tmpdir)
-
     if media_format == "mp3":
-        opts.update(
-            {
-                "format": "bestaudio/best",
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }
-                ],
-            }
-        )
+        opts.update({
+            "format": "bestaudio/best",
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        })
     else:
-        opts.update(
-            {
-                "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                "merge_output_format": "mp4",
-            }
-        )
+        opts.update({
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "merge_output_format": "mp4",
+        })
 
-    _apply_youtube_options(opts, raw_url)
     cookie_file = _attach_instagram_cookiefile(opts, raw_url)
-
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(raw_url, download=True)
-            duration = info.get("duration")
-            if duration and duration > MAX_DURATION_SECONDS:
-                raise ValueError("Conteúdo acima do limite de duração permitido.")
     finally:
         _remove_temp_file(cookie_file)
 
-    files = [p for p in Path(tmpdir).iterdir() if p.is_file()]
-    if not files:
-        raise FileNotFoundError("Arquivo final não encontrado.")
+    duration = info.get("duration")
+    if duration and duration > MAX_DURATION_SECONDS:
+        raise ValueError("Conteúdo acima do limite de duração permitido.")
 
     wanted_ext = ".mp3" if media_format == "mp3" else ".mp4"
+    files = [p for p in Path(tmpdir).iterdir() if p.is_file()]
     candidates = [p for p in files if p.suffix.lower() == wanted_ext]
-    final_path = max(candidates or files, key=lambda p: p.stat().st_mtime)
+    if not candidates:
+        raise FileNotFoundError("Arquivo final não encontrado.")
 
+    final_path = max(candidates, key=lambda p: p.stat().st_mtime)
     title = _safe_filename(str(info.get("title") or "baixou"))
-    download_name = f"{title}{wanted_ext}"
-    return str(final_path), download_name
+    return str(final_path), f"{title}{wanted_ext}"
 
 
 def _cleanup_dir(path: str) -> None:
@@ -277,10 +285,9 @@ def root():
     return {
         "name": APP_NAME,
         "status": "online",
-        "version": "1.3.0",
-        "message": "API do Baixou pronta para processar links públicos suportados.",
+        "version": "1.4.0",
+        "youtube_worker_configured": bool(YOUTUBE_WORKER_URL and YOUTUBE_WORKER_TOKEN),
         "instagram_server_auth_configured": bool(INSTAGRAM_COOKIES_B64),
-        "youtube_po_provider": "bgutil-local",
     }
 
 
@@ -289,46 +296,20 @@ def health():
     return {"ok": True}
 
 
-@app.post("/api/info")
-async def info(payload: InfoRequest, request: Request):
-    _check_rate_limit(request)
-    raw_url = str(payload.url)
-    _validate_url(raw_url)
-
-    try:
-        data = await asyncio.to_thread(_extract_info_sync, raw_url)
-    except yt_dlp.utils.DownloadError as exc:
-        raise HTTPException(status_code=422, detail=_friendly_download_error(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    except Exception:
-        raise HTTPException(status_code=500, detail="Falha ao consultar a mídia.")
-
-    duration = data.get("duration")
-    if duration and duration > MAX_DURATION_SECONDS:
-        raise HTTPException(status_code=413, detail="Conteúdo acima do limite de duração permitido.")
-
-    return {
-        "title": data.get("title"),
-        "thumbnail": data.get("thumbnail"),
-        "duration": duration,
-        "uploader": data.get("uploader") or data.get("channel"),
-        "extractor": data.get("extractor_key") or data.get("extractor"),
-        "webpage_url": data.get("webpage_url") or raw_url,
-    }
-
-
 @app.post("/api/download")
 async def download(payload: MediaRequest, request: Request):
     _check_rate_limit(request)
     raw_url = str(payload.url)
     _validate_url(raw_url)
 
+    if _is_youtube(raw_url):
+        return await _proxy_youtube_download(raw_url, payload.format)
+
     tmpdir = tempfile.mkdtemp(prefix="baixou-")
     try:
         async with _download_semaphore:
             path, download_name = await asyncio.to_thread(
-                _download_sync, raw_url, payload.format, tmpdir
+                _download_instagram_sync, raw_url, payload.format, tmpdir
             )
     except ValueError as exc:
         _cleanup_dir(tmpdir)
@@ -343,10 +324,9 @@ async def download(payload: MediaRequest, request: Request):
         _cleanup_dir(tmpdir)
         raise HTTPException(status_code=500, detail="Falha ao processar o arquivo.")
 
-    media_type = "audio/mpeg" if payload.format == "mp3" else "video/mp4"
     return FileResponse(
         path,
-        media_type=media_type,
+        media_type="audio/mpeg" if payload.format == "mp3" else "video/mp4",
         filename=download_name,
         background=BackgroundTask(_cleanup_dir, tmpdir),
     )
